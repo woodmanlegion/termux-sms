@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 termux-sms-poll — one poll pass: check for new SMS and MMS, advance the
-high-water marks, append to the local inbox log, and fan out to any
-registered handlers.
+high-water marks, record each via the shared message manager
+(_termux_sms_lib), and fan out to any registered handlers.
 
 Runs as a single pass; the sv run script wraps it in a sleep loop (same
 shape as svbase-health's watchdog). Designed so there is exactly ONE
@@ -25,12 +25,9 @@ Usage:
 import sys, os, json, subprocess
 from pathlib import Path
 
-BIN_DIR     = Path(__file__).resolve().parent
-CONFIG_DIR  = Path(os.path.expanduser("~/.config/termux-sms"))
-CONFIG_FILE = CONFIG_DIR / "config"
-STATE_FILE  = CONFIG_DIR / "state.json"
-INBOX_LOG   = CONFIG_DIR / "inbox.jsonl"
-HANDLERS_DIR = CONFIG_DIR / "handlers.d"
+BIN_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN_DIR))
+import _termux_sms_lib as mgr
 
 SU = "/system/xbin/su"
 SMS_RATE_SETTINGS = [
@@ -58,57 +55,6 @@ def apply_rate_limit_fix():
             pass  # non-fatal -- device may not be rooted; sends will just fail later
 
 
-# ── State ───────────────────────────────────────────────────────────────────
-
-def load_state():
-    """Returns None if there's no state file yet -- caller must initialize
-    it by calling init_fresh_state(), not by assuming {-1, 0}. Starting a
-    fresh install from the beginning of history is wrong twice over: it
-    floods every handler with years of backlog, and for MMS specifically
-    it's also a real bug -- each message needs a slow per-message `su`
-    content-provider round-trip, so a full-history replay can take much
-    longer than one poll cycle's timeout, which means mmsHighWater never
-    advances and the next cycle retries the exact same slow full replay,
-    forever. Found live: a device with years of MMS history timed out at
-    20s on every single cycle because of this.
-    """
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return None
-
-
-def init_fresh_state():
-    """First run: start from 'now' -- the current latest id on each side,
-    not from the beginning of history."""
-    latest_sms = run_json([str(BIN_DIR / "sms-receive"), "--limit", "1", "--json"])
-    latest_mms = run_json([str(BIN_DIR / "mms-receive"), "--limit", "1", "--no-save", "--json"])
-    sms_hw = max((m["id"] for m in latest_sms), default=-1)
-    mms_hw = max((m["id"] for m in latest_mms), default=0)
-    return {"smsHighWater": sms_hw, "mmsHighWater": mms_hw}
-
-
-def save_state(state):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state))
-
-
-# ── Config ──────────────────────────────────────────────────────────────────
-
-def load_config():
-    cfg = {}
-    try:
-        for line in CONFIG_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            cfg[k.strip().lower()] = v.strip()
-    except FileNotFoundError:
-        pass
-    return cfg
-
-
 # ── Fetch (shells out to sms-receive / mms-receive -- no logic duplicated) ────
 
 def run_json(cmd, timeout=45):
@@ -131,10 +77,10 @@ def fetch_new_mms(since_id, save_dir):
 # ── Handlers ────────────────────────────────────────────────────────────────
 
 def dispatch_to_handlers(kind, message):
-    if not HANDLERS_DIR.is_dir():
+    if not mgr.HANDLERS_DIR.is_dir():
         return
     payload = json.dumps(message)
-    for handler in sorted(HANDLERS_DIR.iterdir()):
+    for handler in sorted(mgr.HANDLERS_DIR.iterdir()):
         if not handler.is_file() or not os.access(handler, os.X_OK):
             continue
         try:
@@ -146,24 +92,18 @@ def dispatch_to_handlers(kind, message):
             warn(f"handler {handler.name} failed for {kind} id={message.get('id')}: {e}")
 
 
-def append_inbox_log(kind, message):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(INBOX_LOG, "a") as f:
-        f.write(json.dumps({"type": kind, **message}) + "\n")
-
-
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    cfg = load_config()
+    cfg = mgr.load_config()
     save_dir = os.path.expanduser(cfg.get("save_dir", "~/.termux-sms/media/inbound"))
 
     apply_rate_limit_fix()
 
-    state = load_state()
+    state = mgr.load_state()
     if state is None:
-        state = init_fresh_state()
-        save_state(state)
+        state = mgr.init_fresh_state(run_json)
+        mgr.save_state(state)
         log(f"first run -- starting from current (sms={state['smsHighWater']}, "
             f"mms={state['mmsHighWater']}), not replaying history")
         return
@@ -176,7 +116,7 @@ def main():
         state["smsHighWater"] = msg["id"]
         changed = True
         log(f"new SMS id={msg['id']} from={msg['sender']}")
-        append_inbox_log("sms", msg)
+        mgr.log_message("inbound", "sms", msg)
         dispatch_to_handlers("sms", msg)
 
     new_mms = fetch_new_mms(state["mmsHighWater"], save_dir)
@@ -186,11 +126,11 @@ def main():
         state["mmsHighWater"] = msg["id"]
         changed = True
         log(f"new MMS id={msg['id']} from={msg.get('sender')}")
-        append_inbox_log("mms", msg)
+        mgr.log_message("inbound", "mms", msg)
         dispatch_to_handlers("mms", msg)
 
     if changed:
-        save_state(state)
+        mgr.save_state(state)
 
 
 if __name__ == "__main__":

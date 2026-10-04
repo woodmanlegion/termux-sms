@@ -10,7 +10,8 @@ set -euo pipefail
 BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 HOME="${HOME:-/data/data/com.termux/files/home}"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
-CONFIG_DIR="$HOME/.config/termux-sms"
+CONFIG_DIR="$HOME/.config/termux-sms"   # user-edited: config, handlers.d
+DATA_DIR="$HOME/.termux-sms"            # package-generated: state, messages, media
 
 cmd_status() {
     echo "Config file: $CONFIG_DIR/config"
@@ -28,8 +29,8 @@ cmd_status() {
     fi
 
     echo "State:"
-    if [[ -f "$CONFIG_DIR/state.json" ]]; then
-        cat "$CONFIG_DIR/state.json" | sed 's/^/  /'
+    if [[ -f "$DATA_DIR/state.json" ]]; then
+        cat "$DATA_DIR/state.json" | sed 's/^/  /'
     else
         echo "  no state file yet (poller hasn't run)"
     fi
@@ -40,6 +41,14 @@ cmd_status() {
         ls "$CONFIG_DIR/handlers.d" | sed 's/^/  /'
     else
         echo "  none"
+    fi
+    echo
+
+    echo "Recent messages (last 5, both directions):"
+    if [[ -f "$DATA_DIR/messages.jsonl" ]]; then
+        tail -5 "$DATA_DIR/messages.jsonl" | sed 's/^/  /'
+    else
+        echo "  none yet"
     fi
 }
 
@@ -79,9 +88,12 @@ cmd_handlers() {
 case "${1:-status}" in
     status)   cmd_status ;;
     handlers) shift; cmd_handlers "$@" ;;
-    send)     shift; exec "$BIN_DIR/sms-send" "$@" ;;
+    # send/send-mms go through the message manager (termux-sms-send) so the
+    # outbound attempt gets logged -- the raw sms-send/mms-send bins still
+    # work directly for scripting, they just won't be recorded that way.
+    send)     shift; exec "$BIN_DIR/termux-sms-send" sms "$@" ;;
+    send-mms) shift; exec "$BIN_DIR/termux-sms-send" mms "$@" ;;
     receive)  shift; exec "$BIN_DIR/sms-receive" "$@" ;;
-    send-mms) shift; exec "$BIN_DIR/mms-send" "$@" ;;
     receive-mms) shift; exec "$BIN_DIR/mms-receive" "$@" ;;
     poll-once) shift; exec "$BIN_DIR/termux-sms-poll" "$@" ;;
     *)

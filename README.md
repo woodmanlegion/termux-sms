@@ -27,30 +27,52 @@ and one config.
 | `mms-send-auto` / `mms-send-smart` | Higher-level MMS send wrappers |
 | `mms-fetch` / `mms-check` / `mms-calibrate` | MMS send support tooling |
 | `termux-sms-poll` | One poll pass — checks both SMS and MMS, advances state, fans out to handlers |
-| `termux-sms` | Unified status/handler-management CLI |
+| `termux-sms-send` | The message manager's send entrypoint — logs outbound, then sends |
+| `termux-sms` | Unified status/handler-management/send CLI |
 
-## The poller: one reader, pluggable handlers
+## Two directories, two purposes
 
-`termux-sms-poll` is the **only** thing that should ever poll this SIM's
-inbox. It runs under `sv` (installed by `install.sh`) on an interval,
-advances one shared high-water-mark state file
-(`~/.config/termux-sms/state.json`), and for every genuinely new message:
+- `~/.config/termux-sms/` — things *you* edit: `config` (your number, MMSC
+  settings, ...) and `handlers.d/` (scripts you register).
+- `~/.termux-sms/` — things the *package* generates: `state.json` (poll
+  high-water marks), `messages.jsonl` (the message log, both directions),
+  `media/inbound/` (saved MMS parts).
 
-1. Appends it to `~/.config/termux-sms/inbox.jsonl` (a plain append-only log).
-2. Runs every executable in `~/.config/termux-sms/handlers.d/` once, with
-   the message as JSON on stdin and `sms` or `mms` as `argv[1]`.
+## The message manager: one poller, one log, pluggable handlers
 
-This is the extension point for "multiple things want to react to the
-same inbound message" (an openclaw channel, a contact-specific
-auto-responder, whatever else) — they each become one handler script,
-not a second independent poller. A handler that exits non-zero is logged
-and skipped; it never blocks the other handlers or blocks state
-advancement.
+`_termux_sms_lib.py` is the actual message-manager module — the one
+place that knows how to record a message and how to load/save poll
+state. Both directions go through it:
+
+- **Inbound**: `termux-sms-poll` is the **only** thing that should ever
+  poll this SIM's inbox. It runs under `sv` on an interval, and for every
+  genuinely new message, calls `log_message("inbound", ...)` then fans
+  out to every executable in `~/.config/termux-sms/handlers.d/` (message
+  as JSON on stdin, `sms`/`mms` as `argv[1]`). A handler that exits
+  non-zero is logged and skipped — it never blocks another handler or
+  blocks state advancement.
+- **Outbound**: `termux-sms-send <sms|mms> <to> <body-or-file>` calls the
+  real `sms-send`/`mms-http-send`, then calls `log_message("outbound",
+  ...)` with the result — success or failure, always logged. `termux-sms
+  send`/`termux-sms send-mms` route through this; the raw `sms-send`/
+  `mms-send` bins still work completely standalone with no logging, for
+  direct scripting use.
+
+Both directions land in the same `~/.termux-sms/messages.jsonl`, each
+entry stamped with `direction: inbound|outbound`.
+
+Looking forward: `termux-sms-channel` (the openclaw plugin, still
+separate, not yet rewired) should call `send_sms`/`send_mms` from the
+shared lib directly instead of invoking the raw CLI tools itself — even
+as a pure pass-through, that keeps logging in exactly one place instead
+of being duplicated per-consumer.
 
 ```bash
 termux-sms handlers add ~/my-scripts/notify-slack.sh
 termux-sms handlers list
 termux-sms handlers remove notify-slack.sh
+termux-sms send +15551234567 "hello"       # logged
+termux-sms send-mms +15551234567 photo.jpg  # logged
 ```
 
 ## Install

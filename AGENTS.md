@@ -8,6 +8,13 @@
    loop anywhere in this repo or suggest one in docs — new consumers are
    handlers in `handlers.d/`, not new pollers. This is the whole point of
    consolidating four repos into one.
+2a. **`_termux_sms_lib.py` is the only place state/message-log logic
+   lives.** Both directions (inbound via the poller, outbound via
+   `termux-sms-send`) go through it. If a new entrypoint needs to record
+   a message, it imports this module and calls `log_message`/`send_sms`/
+   `send_mms` — it does not reimplement logging inline the way the
+   original four source repos each reimplemented their own config
+   parsing.
 3. **A handler that fails must never block another handler or block
    state advancement.** Log it (stderr) and move on. Verified by a real
    test in this repo's history — don't regress it.

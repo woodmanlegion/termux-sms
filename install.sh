@@ -23,8 +23,9 @@ PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 HOME="${HOME:-/data/data/com.termux/files/home}"
 export SVDIR="${SVDIR:-$PREFIX/var/service}"
 
-CONFIG_DIR="$HOME/.config/termux-sms"
-mkdir -p "$CONFIG_DIR/handlers.d"
+CONFIG_DIR="$HOME/.config/termux-sms"   # user-edited: config, handlers.d
+DATA_DIR="$HOME/.termux-sms"            # package-generated: state, messages, media
+mkdir -p "$CONFIG_DIR/handlers.d" "$DATA_DIR"
 
 # 1. Symlink bins.
 USER_BIN="$HOME/.local/bin"

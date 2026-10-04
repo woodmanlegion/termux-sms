@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""
+termux-sms-send — the message-manager's send entrypoint. Logs every
+outbound attempt (success or failure) to ~/.termux-sms/messages.jsonl
+before returning, then calls the real sms-send/mms-http-send.
+
+The underlying sms-send/mms-send/mms-http-send bins still work completely
+standalone, with no logging, for scripting/direct use -- that's by
+design (see AGENTS.md). Anything that wants the outbound record kept
+(termux-sms's own CLI, and eventually termux-sms-channel) goes through
+this instead.
+
+Usage:
+  termux-sms-send sms <phone> <message> [--json]
+  termux-sms-send mms <phone> <file> [--json]
+"""
+
+import sys, json
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _termux_sms_lib as mgr
+
+
+def main():
+    args = sys.argv[1:]
+    json_mode = "--json" in args
+    args = [a for a in args if a != "--json"]
+
+    if len(args) < 3 or args[0] not in ("sms", "mms"):
+        print("Usage: termux-sms-send <sms|mms> <phone> <message-or-file> [--json]", file=sys.stderr)
+        sys.exit(1)
+
+    kind, to, payload_arg = args[0], args[1], args[2]
+
+    if kind == "sms":
+        ok, result = mgr.send_sms(to, payload_arg)
+    else:
+        ok, result = mgr.send_mms(to, payload_arg)
+
+    if json_mode:
+        print(json.dumps(result))
+    else:
+        if ok:
+            print(f"[termux-sms-send] sent ({kind}) to {to}")
+        else:
+            print(f"[termux-sms-send] ERROR: {result.get('error', 'send failed')}", file=sys.stderr)
+
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
