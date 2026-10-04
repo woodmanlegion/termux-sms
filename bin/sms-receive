@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+sms-receive — Query received SMS via termux-sms-list, with high-water-mark
+support for polling (mirrors mms-receive's --since/--oldest-first shape so
+a single poller can treat SMS and MMS the same way).
+
+Usage:
+  sms-receive [--limit N] [--since ID] [--oldest-first] [--json]
+  sms-receive --show-config
+
+No root required — termux-sms-list is a regular Termux:API command.
+Platform: Android/Termux only.
+"""
+
+import sys, os, json, subprocess
+
+# ── Configuration resolution ──────────────────────────────────────────────────
+# Priority (highest first):
+#   1. ~/.config/termux-sms/config  (INI-style KEY = value, # comments)
+#   2. Environment variables
+#   3. Built-in defaults
+
+CONFIG_FILE = os.path.expanduser("~/.config/termux-sms/config")
+TERMUX_SMS_LIST = "/data/data/com.termux/files/usr/bin/termux-sms-list"
+
+_BUILTIN = {
+    "sms_receive_limit": "20",
+}
+
+def _load_config_file(path):
+    cfg = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    cfg[k.strip().lower()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+def _resolve_config():
+    file_cfg = _load_config_file(CONFIG_FILE)
+    cfg, sources = {}, {}
+
+    def pick(key, env_keys=()):
+        if key in file_cfg:
+            cfg[key] = file_cfg[key]
+            sources[key] = f"file:{CONFIG_FILE}"
+            return
+        for env_key in env_keys:
+            val = os.environ.get(env_key)
+            if val:
+                cfg[key] = val
+                sources[key] = f"env:{env_key}"
+                return
+        cfg[key] = _BUILTIN[key]
+        sources[key] = "default"
+
+    pick("sms_receive_limit", ("SMS_RECEIVE_LIMIT",))
+    return cfg, sources
+
+CFG, _SOURCES = _resolve_config()
+
+# ── Fetch logic ────────────────────────────────────────────────────────────────
+
+def fetch_inbox(limit):
+    try:
+        result = subprocess.run(
+            [TERMUX_SMS_LIST, "-l", str(limit), "-t", "inbox"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        print(f"[sms-receive] ERROR: {TERMUX_SMS_LIST} not found — "
+              f"install termux-api (pkg) and the Termux:API app.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("[sms-receive] ERROR: termux-sms-list timed out", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(f"[sms-receive] ERROR: could not parse termux-sms-list output: "
+              f"{result.stdout[:200]!r}", file=sys.stderr)
+        sys.exit(1)
+
+    return parsed if isinstance(parsed, list) else []
+
+def fetch_sms(limit=None, since_id=None, oldest_first=False):
+    limit = int(limit or CFG["sms_receive_limit"])
+    # termux-sms-list has no native --since filter -- fetch generously, filter here.
+    fetch_limit = max(limit, 50) if since_id is not None else limit
+    messages = fetch_inbox(fetch_limit)
+
+    results = []
+    for msg in messages:
+        msg_id = msg.get("_id", msg.get("threadid"))
+        if msg_id is None:
+            continue
+        if since_id is not None and int(msg_id) <= int(since_id):
+            continue
+        results.append({
+            "id":     int(msg_id),
+            "date":   msg.get("received") or msg.get("date"),
+            "sender": str(msg.get("number") or msg.get("address") or "").strip(),
+            "body":   str(msg.get("body") or "").strip(),
+        })
+
+    results.sort(key=lambda m: m["id"])
+    if oldest_first:
+        return results[:limit]
+    return list(reversed(results))[:limit]
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def show_config():
+    print(json.dumps({
+        "config": CFG,
+        "sources": _SOURCES,
+        "config_file": CONFIG_FILE,
+        "config_file_exists": os.path.exists(CONFIG_FILE),
+        "termux_sms_list": TERMUX_SMS_LIST,
+        "termux_sms_list_exists": os.path.exists(TERMUX_SMS_LIST),
+    }, indent=2))
+
+def main():
+    args = sys.argv[1:]
+
+    if "--show-config" in args:
+        show_config()
+        return
+
+    limit        = None
+    since_id     = None
+    oldest_first = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-l", "--limit") and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif a == "--since" and i + 1 < len(args):
+            since_id = int(args[i + 1]); i += 2
+        elif a == "--oldest-first":
+            oldest_first = True; i += 1
+        elif a == "--json":
+            i += 1   # json is always the output format
+        else:
+            print(f"[sms-receive] unknown argument: {a}", file=sys.stderr)
+            sys.exit(1)
+
+    results = fetch_sms(limit=limit, since_id=since_id, oldest_first=oldest_first)
+    print(json.dumps(results, indent=2))
+
+if __name__ == "__main__":
+    main()

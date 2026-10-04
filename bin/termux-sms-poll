@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+termux-sms-poll — one poll pass: check for new SMS and MMS, advance the
+high-water marks, append to the local inbox log, and fan out to any
+registered handlers.
+
+Runs as a single pass; the sv run script wraps it in a sleep loop (same
+shape as svbase-health's watchdog). Designed so there is exactly ONE
+poller for the SIM's inbox, ever -- multiple consumers (an openclaw
+channel, a standalone auto-responder, whatever else) subscribe as
+handlers instead of each polling independently, which is what actually
+avoids two things racing to process the same inbound message.
+
+Handlers: any executable file in ~/.config/termux-sms/handlers.d/ gets
+run once per new message, with the message as JSON on stdin and the
+type ("sms" or "mms") as argv[1]. A handler that exits non-zero is
+logged and skipped -- one broken handler never blocks the others or
+blocks state advancement.
+
+Usage:
+  termux-sms-poll           Run one poll pass
+  termux-sms-poll --once    Same (explicit, for clarity in cron/manual runs)
+"""
+
+import sys, os, json, subprocess
+from pathlib import Path
+
+BIN_DIR     = Path(__file__).resolve().parent
+CONFIG_DIR  = Path(os.path.expanduser("~/.config/termux-sms"))
+CONFIG_FILE = CONFIG_DIR / "config"
+STATE_FILE  = CONFIG_DIR / "state.json"
+INBOX_LOG   = CONFIG_DIR / "inbox.jsonl"
+HANDLERS_DIR = CONFIG_DIR / "handlers.d"
+
+SU = "/system/xbin/su"
+SMS_RATE_SETTINGS = [
+    ("sms_outgoing_check_max_count", "99999"),
+    ("sms_outgoing_check_interval_ms", "99999999"),
+]
+
+
+def log(msg):
+    print(f"[termux-sms-poll] {msg}")
+
+
+def warn(msg):
+    print(f"[termux-sms-poll] WARN: {msg}", file=sys.stderr)
+
+
+# ── Rate-limit fix (folded in from sms-limit-apply) ────────────────────────────
+
+def apply_rate_limit_fix():
+    for key, value in SMS_RATE_SETTINGS:
+        try:
+            subprocess.run([SU, "-c", f"settings put global {key} {value}"],
+                            capture_output=True, timeout=5)
+        except Exception:
+            pass  # non-fatal -- device may not be rooted; sends will just fail later
+
+
+# ── State ───────────────────────────────────────────────────────────────────
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {"smsHighWater": -1, "mmsHighWater": 0}
+
+
+def save_state(state):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state))
+
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
+def load_config():
+    cfg = {}
+    try:
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            cfg[k.strip().lower()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+# ── Fetch (shells out to sms-receive / mms-receive -- no logic duplicated) ────
+
+def run_json(cmd):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        return json.loads(result.stdout)
+    except Exception as e:
+        warn(f"{cmd[0]} failed: {e}")
+        return []
+
+
+def fetch_new_sms(since_id):
+    return run_json([str(BIN_DIR / "sms-receive"), "--since", str(since_id), "--oldest-first", "--json"])
+
+
+def fetch_new_mms(since_id, save_dir):
+    return run_json([str(BIN_DIR / "mms-receive"), "--since", str(since_id), "--oldest-first", "--save", save_dir, "--json"])
+
+
+# ── Handlers ────────────────────────────────────────────────────────────────
+
+def dispatch_to_handlers(kind, message):
+    if not HANDLERS_DIR.is_dir():
+        return
+    payload = json.dumps(message)
+    for handler in sorted(HANDLERS_DIR.iterdir()):
+        if not handler.is_file() or not os.access(handler, os.X_OK):
+            continue
+        try:
+            subprocess.run([str(handler), kind], input=payload, text=True,
+                            capture_output=True, timeout=30, check=True)
+        except subprocess.CalledProcessError as e:
+            warn(f"handler {handler.name} exited {e.returncode} for {kind} id={message.get('id')}")
+        except Exception as e:
+            warn(f"handler {handler.name} failed for {kind} id={message.get('id')}: {e}")
+
+
+def append_inbox_log(kind, message):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(INBOX_LOG, "a") as f:
+        f.write(json.dumps({"type": kind, **message}) + "\n")
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    cfg = load_config()
+    save_dir = os.path.expanduser(cfg.get("save_dir", "~/.termux-sms/media/inbound"))
+
+    apply_rate_limit_fix()
+
+    state = load_state()
+    changed = False
+
+    new_sms = fetch_new_sms(state["smsHighWater"])
+    for msg in new_sms:
+        if msg["id"] <= state["smsHighWater"]:
+            continue
+        state["smsHighWater"] = msg["id"]
+        changed = True
+        log(f"new SMS id={msg['id']} from={msg['sender']}")
+        append_inbox_log("sms", msg)
+        dispatch_to_handlers("sms", msg)
+
+    new_mms = fetch_new_mms(state["mmsHighWater"], save_dir)
+    for msg in new_mms:
+        if msg["id"] <= state["mmsHighWater"]:
+            continue
+        state["mmsHighWater"] = msg["id"]
+        changed = True
+        log(f"new MMS id={msg['id']} from={msg.get('sender')}")
+        append_inbox_log("mms", msg)
+        dispatch_to_handlers("mms", msg)
+
+    if changed:
+        save_state(state)
+
+
+if __name__ == "__main__":
+    main()

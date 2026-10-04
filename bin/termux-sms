@@ -1,0 +1,91 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# termux-sms — unified CLI entrypoint for the termux-sms package.
+# The individual bins (sms-send, sms-receive, mms-receive, mms-http-send,
+# ...) all still work standalone; this is just a convenience wrapper plus
+# the status/handler-management commands that don't belong in any one
+# of them.
+
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HOME="${HOME:-/data/data/com.termux/files/home}"
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+CONFIG_DIR="$HOME/.config/termux-sms"
+
+cmd_status() {
+    echo "Config file: $CONFIG_DIR/config"
+    if [[ -f "$CONFIG_DIR/config" ]]; then
+        echo "  present"
+    else
+        echo "  MISSING -- copy config.example there and set FROM_NUMBER (sending will fail until then)"
+    fi
+
+    echo "Poller service:"
+    if command -v sv >/dev/null 2>&1; then
+        SVDIR="${SVDIR:-$PREFIX/var/service}" sv status termux-sms-poll 2>&1 | sed 's/^/  /'
+    else
+        echo "  sv not available"
+    fi
+
+    echo "State:"
+    if [[ -f "$CONFIG_DIR/state.json" ]]; then
+        cat "$CONFIG_DIR/state.json" | sed 's/^/  /'
+    else
+        echo "  no state file yet (poller hasn't run)"
+    fi
+    echo
+
+    echo "Handlers registered:"
+    if [[ -d "$CONFIG_DIR/handlers.d" ]] && [[ -n "$(ls -A "$CONFIG_DIR/handlers.d" 2>/dev/null)" ]]; then
+        ls "$CONFIG_DIR/handlers.d" | sed 's/^/  /'
+    else
+        echo "  none"
+    fi
+}
+
+cmd_handlers() {
+    case "${1:-list}" in
+        list)
+            cmd_status | sed -n '/Handlers registered:/,$p'
+            ;;
+        add)
+            local script="${2:-}"
+            if [[ -z "$script" || ! -f "$script" ]]; then
+                echo "usage: termux-sms handlers add <path-to-executable>" >&2
+                exit 1
+            fi
+            mkdir -p "$CONFIG_DIR/handlers.d"
+            local dest="$CONFIG_DIR/handlers.d/$(basename "$script")"
+            ln -sf "$(readlink -f "$script")" "$dest"
+            chmod +x "$dest"
+            echo "registered handler: $dest -> $(readlink -f "$script")"
+            ;;
+        remove)
+            local name="${2:-}"
+            if [[ -z "$name" ]]; then
+                echo "usage: termux-sms handlers remove <name>" >&2
+                exit 1
+            fi
+            rm -f "$CONFIG_DIR/handlers.d/$name"
+            echo "removed handler: $name"
+            ;;
+        *)
+            echo "usage: termux-sms handlers <list|add <path>|remove <name>>" >&2
+            exit 1
+            ;;
+    esac
+}
+
+case "${1:-status}" in
+    status)   cmd_status ;;
+    handlers) shift; cmd_handlers "$@" ;;
+    send)     shift; exec "$BIN_DIR/sms-send" "$@" ;;
+    receive)  shift; exec "$BIN_DIR/sms-receive" "$@" ;;
+    send-mms) shift; exec "$BIN_DIR/mms-send" "$@" ;;
+    receive-mms) shift; exec "$BIN_DIR/mms-receive" "$@" ;;
+    poll-once) shift; exec "$BIN_DIR/termux-sms-poll" "$@" ;;
+    *)
+        echo "usage: termux-sms <status|send <phone> <msg>|receive|send-mms <phone> <file>|receive-mms|handlers ...|poll-once>" >&2
+        exit 1
+        ;;
+esac

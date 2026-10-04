@@ -1,0 +1,157 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# mms-fetch — Fetch MMS image attachments from Android telephony DB
+# Requires: root (su), sqlite3
+# Usage:
+#   mms-fetch                — fetch latest MMS image
+#   mms-fetch --latest       — same as above
+#   mms-fetch --all          — fetch all MMS images
+#   mms-fetch --list         — list available MMS images (no download)
+#   mms-fetch --id N         — fetch specific part by _id
+#   mms-fetch --since TIMESTAMP — fetch images newer than epoch seconds
+# Output: ~/Downloads/mms/ directory with files named by date + part_id
+
+set -euo pipefail
+
+DB="/data/data/com.android.providers.telephony/databases/mmssms.db"
+PARTS_DIR="/data/user_de/0/com.android.providers.telephony/app_parts"
+OUT_DIR="${HOME}/Downloads/mms"
+PROGNAME="$(basename "$0")"
+
+usage() {
+    cat <<EOF
+Usage: $PROGNAME [options]
+
+Options:
+  --latest           Fetch the most recent MMS image (default)
+  --all              Fetch all MMS images
+  --list             List available MMS images without downloading
+  --id N             Fetch a specific part by _id
+  --since TIMESTAMP  Fetch images from MMS messages newer than epoch seconds
+  --out DIR          Output directory (default: ~/Downloads/mms)
+  --help             Show this help
+
+Examples:
+  $PROGNAME                    # Get latest MMS image
+  $PROGNAME --all              # Get all MMS images
+  $PROGNAME --since 1782000000 # Get images since ~June 19 2026
+  $PROGNAME --list             # Just list what's available
+EOF
+    exit 0
+}
+
+# Parse args
+MODE="latest"
+SINCE=""
+PART_ID=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --latest)  MODE="latest"; shift ;;
+        --all)     MODE="all"; shift ;;
+        --list)    MODE="list"; shift ;;
+        --id)      MODE="id"; PART_ID="$2"; shift 2 ;;
+        --since)   MODE="since"; SINCE="$2"; shift 2 ;;
+        --out)     OUT_DIR="$2"; shift 2 ;;
+        --help|-h) usage ;;
+        *) echo "Unknown option: $1" >&2; usage ;;
+    esac
+done
+
+mkdir -p "$OUT_DIR"
+
+# Build query based on mode
+case "$MODE" in
+    latest)
+        QUERY="SELECT pt._id, pt.mid, pt.ct, pt._data, pdu.date, pdu.thread_id
+               FROM part pt
+               JOIN pdu ON pdu._id = pt.mid
+               WHERE pt.ct LIKE 'image/%' OR pt.ct LIKE 'audio/%'
+               ORDER BY pdu.date DESC LIMIT 1;"
+        ;;
+    all)
+        QUERY="SELECT pt._id, pt.mid, pt.ct, pt._data, pdu.date, pdu.thread_id
+               FROM part pt
+               JOIN pdu ON pdu._id = pt.mid
+               WHERE pt.ct LIKE 'image/%' OR pt.ct LIKE 'audio/%'
+               ORDER BY pdu.date DESC;"
+        ;;
+    list)
+        QUERY="SELECT pt._id, pt.mid, pt.ct, pt._data, pdu.date, pdu.thread_id,
+                      (SELECT GROUP_CONCAT(address, ', ') FROM addr WHERE msg_id = pt.mid) as addresses
+               FROM part pt
+               JOIN pdu ON pdu._id = pt.mid
+               WHERE pt.ct LIKE 'image/%' OR pt.ct LIKE 'audio/%'
+               ORDER BY pdu.date DESC;"
+        ;;
+    id)
+        QUERY="SELECT pt._id, pt.mid, pt.ct, pt._data, pdu.date, pdu.thread_id
+               FROM part pt
+               JOIN pdu ON pdu._id = pt.mid
+               WHERE pt._id = ${PART_ID};"
+        ;;
+    since)
+        QUERY="SELECT pt._id, pt.mid, pt.ct, pt._data, pdu.date, pdu.thread_id
+               FROM part pt
+               JOIN pdu ON pdu._id = pt.mid
+               WHERE pt.ct LIKE 'image/%' OR pt.ct LIKE 'audio/%' AND pdu.date > ${SINCE}
+               ORDER BY pdu.date DESC;"
+        ;;
+esac
+
+# Execute query
+RESULTS=$(su -c "sqlite3 -separator '|' '$DB' \"$QUERY\"" 2>&1)
+
+if [[ -z "$RESULTS" || "$RESULTS" == "" ]]; then
+    echo "No MMS attachments found."
+    exit 0
+fi
+
+# Handle --list mode
+if [[ "$MODE" == "list" ]]; then
+    printf "%-6s %-8s %-12s %-20s %s\n" "ID" "MMS_ID" "TYPE" "DATE" "FROM"
+    printf "%-6s %-8s %-12s %-20s %s\n" "--" "------" "----" "----" "----"
+    while IFS='|' read -r pid mid ct _data date thread_id addresses; do
+        # Convert epoch to human-readable
+        hdate=$(date -d "@${date}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$date")
+        printf "%-6s %-8s %-12s %-20s %s\n" "$pid" "$mid" "$ct" "$hdate" "${addresses:-unknown}"
+    done <<< "$RESULTS"
+    exit 0
+fi
+
+# Download mode
+COUNT=0
+while IFS='|' read -r pid mid ct src_path date thread_id; do
+    if [[ -z "$src_path" ]]; then
+        echo "Part $pid: no file path, skipping"
+        continue
+    fi
+
+    # Determine extension from content type
+    ext="jpg"
+    case "$ct" in
+        image/jpeg|image/jpg) ext="jpg" ;;
+        image/png) ext="png" ;;
+        image/gif) ext="gif" ;;
+        image/webp) ext="webp" ;;
+        image/bmp) ext="bmp" ;;
+        *) ext="bin" ;;
+    esac
+
+    # Human-readable date for filename
+    hdate=$(date -d "@${date}" '+%Y%m%d_%H%M%S' 2>/dev/null || echo "$date")
+    outfile="${OUT_DIR}/mms_${hdate}_part${pid}.${ext}"
+
+    # Copy via su
+    su -c "cp '$src_path' '$outfile'" 2>&1
+    if [[ $? -eq 0 ]]; then
+        su -c "chmod 644 '$outfile'"
+        fsize=$(stat -c%s "$outfile" 2>/dev/null || echo "?")
+        echo "✓ Downloaded: $outfile ($fsize bytes)"
+        echo "  Part ID: $pid | MMS ID: $mid | Type: $ct | Date: $(date -d "@${date}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$date")"
+        COUNT=$((COUNT + 1))
+    else
+        echo "✗ Failed to copy: $src_path"
+    fi
+done <<< "$RESULTS"
+
+echo ""
+echo "Done. $COUNT image(s) saved to $OUT_DIR"

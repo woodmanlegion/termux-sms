@@ -1,0 +1,144 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# mms-check — Check for new MMS images AND audio, notify via Discord
+# Called by cron. Tracks seen MMS part IDs in a state file.
+# Audio parts are extracted, converted, and transcribed via Whisper.
+
+STATE_FILE="${HOME}/.config/mms-check/seen_ids"
+STATE_DIR="$(dirname "$STATE_FILE")"
+mkdir -p "$STATE_DIR"
+OUT_DIR="${HOME}/Downloads/mms"
+mkdir -p "$OUT_DIR"
+
+DB="/data/data/com.android.providers.telephony/databases/mmssms.db"
+
+# Query for both image and audio parts
+RESULTS=$(su -c "sqlite3 -separator '|' '$DB' \"SELECT pt._id, pt.mid, pt.ct, pt._data, pt.name, pdu.date FROM part pt JOIN pdu ON pdu._id = pt.mid WHERE (pt.ct LIKE 'image/%' OR pt.ct LIKE 'audio/%') AND pdu.msg_box = 1 ORDER BY pdu.date DESC;\"" 2>&1)
+
+if [[ -z "$RESULTS" ]]; then
+    echo "NO_NEW_MMS"
+    exit 0
+fi
+
+# Load seen IDs
+SEEN=""
+if [[ -f "$STATE_FILE" ]]; then
+    SEEN=$(cat "$STATE_FILE")
+fi
+
+NEW_IDS=()
+while IFS='|' read -r pid mid ct src_path name date; do
+    if echo "$SEEN" | grep -qx "$pid"; then
+        continue
+    fi
+    NEW_IDS+=("$pid|$mid|$ct|$src_path|$name|$date")
+done <<< "$RESULTS"
+
+if [[ ${#NEW_IDS[@]} -eq 0 ]]; then
+    echo "NO_NEW_MMS"
+    exit 0
+fi
+
+# Process new parts
+FETCHED=()
+for entry in "${NEW_IDS[@]}"; do
+    IFS='|' read -r pid mid ct src_path name date <<< "$entry"
+    hdate=$(date -d "@${date}" '+%Y%m%d_%H%M%S' 2>/dev/null || echo "$date")
+    sender=$(su -c "sqlite3 '$DB' \"SELECT GROUP_CONCAT(address, ', ') FROM addr WHERE msg_id = $mid;\"" 2>&1)
+
+    if [[ "$ct" == image/* ]]; then
+        # --- IMAGE: use existing mms-fetch ---
+        ~/Scripts/mms-fetch --id "$pid" > /dev/null 2>&1
+        ext="jpg"
+        case "$ct" in
+            image/jpeg|image/jpg) ext="jpg" ;;
+            image/png) ext="png" ;;
+            image/gif) ext="gif" ;;
+            image/webp) ext="webp" ;;
+        esac
+        filepath="${OUT_DIR}/mms_${hdate}_part${pid}.${ext}"
+        FETCHED+=("image|${pid}|${filepath}|${ct}|${date}|${sender:-unknown}|")
+    else
+        # --- AUDIO: extract, convert, transcribe ---
+        safe_name="${name:-audio_${pid}}"
+        amr_path="${OUT_DIR}/mms_${hdate}_${safe_name}"
+        wav_path="${OUT_DIR}/mms_${hdate}_part${pid}.wav"
+        txt_path="${OUT_DIR}/mms_${hdate}_part${pid}.txt"
+
+        # Copy AMR from protected storage
+        su -c "cp '${src_path}' '${amr_path}' && chmod 644 '${amr_path}'" 2>/dev/null
+
+        transcript=""
+        if [[ -f "$amr_path" ]]; then
+            # Convert to WAV
+            ffmpeg -i "$amr_path" -ar 16000 -ac 1 "$wav_path" -y -loglevel error 2>/dev/null
+
+            if [[ -f "$wav_path" ]]; then
+                # Transcribe locally via sherpa-onnx Whisper (no API key)
+                SHERPA_STT="/data/data/com.termux/files/home/Projects/45_sherpa-onyx-take-2/bin/sherpa-stt"
+                if [[ -x "$SHERPA_STT" ]]; then
+                    transcript=$("$SHERPA_STT" "$wav_path" 2>/dev/null)
+                    if [[ -n "$transcript" ]]; then
+                        echo "$transcript" > "$txt_path"
+                    fi
+                fi
+            fi
+        fi
+
+        # Truncate transcript for notification
+        transcript_excerpt=""
+        if [[ -n "$transcript" ]]; then
+            if [[ ${#transcript} -gt 300 ]]; then
+                transcript_excerpt="${transcript:0:297}..."
+            else
+                transcript_excerpt="$transcript"
+            fi
+        fi
+
+        FETCHED+=("audio|${pid}|${amr_path}|${ct}|${date}|${sender:-unknown}|${transcript_excerpt}")
+    fi
+done
+
+# Save new IDs to state file
+for entry in "${NEW_IDS[@]}"; do
+    IFS='|' read -r pid rest <<< "$entry"
+    echo "$pid" >> "$STATE_FILE"
+done
+
+# Build notification message
+IMG_COUNT=0
+AUD_COUNT=0
+MSG=""
+
+for entry in "${FETCHED[@]}"; do
+    IFS='|' read -r kind pid filepath ct date sender transcript_excerpt <<< "$entry"
+    hdate=$(date -d "@${date}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$date")
+
+    if [[ "$kind" == "image" ]]; then
+        ((IMG_COUNT++))
+        MSG="${MSG}\n📸 **Image** from ${sender}"
+        MSG="${MSG}\n  • Date: ${hdate} | Type: ${ct}"
+        MSG="${MSG}\n  • Saved: ${filepath}"
+    else
+        ((AUD_COUNT++))
+        MSG="${MSG}\n🎙️ **Audio** from ${sender}"
+        MSG="${MSG}\n  • Date: ${hdate} | Type: ${ct}"
+        MSG="${MSG}\n  • Saved: ${filepath}"
+        if [[ -n "$transcript_excerpt" ]]; then
+            MSG="${MSG}\n  • Transcript: \"${transcript_excerpt}\""
+        else
+            MSG="${MSG}\n  • Transcript: (failed)"
+        fi
+    fi
+done
+
+# Summary header
+HEADER=""
+if [[ $IMG_COUNT -gt 0 && $AUD_COUNT -gt 0 ]]; then
+    HEADER="📱 New MMS: ${IMG_COUNT} image(s), ${AUD_COUNT} audio(s)"
+elif [[ $IMG_COUNT -gt 0 ]]; then
+    HEADER="📸 New MMS image${IMG_COUNT:+s} (${IMG_COUNT})"
+else
+    HEADER="🎙️ New MMS audio${AUD_COUNT:+s} (${AUD_COUNT})"
+fi
+
+echo -e "${HEADER}${MSG}"

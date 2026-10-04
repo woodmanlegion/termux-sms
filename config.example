@@ -1,0 +1,24 @@
+# ~/.config/termux-sms/config — example configuration
+# Copy to ~/.config/termux-sms/config and fill in your real values.
+# ~/.config/termux-sms/ is outside this repo and never committed.
+#
+# See README.md for full documentation of each field.
+
+# Shared (sms-send + mms-http-send)
+FROM_NUMBER = +15550000000           # your SIM's E.164 number
+
+# sms-send only
+SIM_SLOT             = 0             # dual-SIM slot; 0 = default, -1 = system pick
+APPLY_RATE_LIMIT_FIX = true
+SMS_SEND_TIMEOUT     = 30
+
+# sms-receive / mms-receive only
+SAVE_DIR = ~/.termux-sms/media/inbound
+LIMIT    = 10
+
+# mms-http-send only
+# INTERFACE = rmnet_data1            # omit to auto-detect active rmnet; set explicitly only if auto-detect picks wrong interface
+MMSC        = http://mmsc.mobile.att.net
+PROXY_IP    = 172.26.39.1            # AT&T WAP proxy — cached YYYY-MM-DD; DNS tried first at runtime
+PROXY_PORT  = 80
+MAX_BYTES   = 900000

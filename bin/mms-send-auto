@@ -1,0 +1,179 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# mms-send-auto - Improved automatic MMS sender for Android
+# Requires: root (su), Google Messages installed
+# Usage: mms-send-auto <phone> <file> [--coords x,y,x,y,x,y]
+
+set -e
+
+PHONE="${1:-}"
+FILE="${2:-}"
+shift 2 2>/dev/null || true
+
+# Default coordinates for 1080x2460 screen (Motorola Edge)
+# Format: attach_button_x,attach_button_y,menu_item_x,menu_item_y,file_x,file_y,send_x,send_y
+COORDS="900,2200,540,1800,200,400,540,600,900,2200"
+
+# Parse optional --coords argument
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --coords)
+            COORDS="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Validate inputs
+if [ -z "$PHONE" ] || [ -z "$FILE" ]; then
+    echo "Usage: mms-send-auto <phone> <file> [--coords x1,y1,x2,y2,x3,y3,x4,y4,x5,y5]"
+    echo ""
+    echo "Coordinates (for 1080x2460 screen):"
+    echo "  900,2200 = attachment button"
+    echo "  540,1800 = menu item (Attach file)"
+    echo "  200,400  = Downloads folder"
+    echo "  540,600  = file in list"
+    echo "  900,2200 = send button"
+    echo ""
+    echo "Example: mms-send-auto +15550001111 /sdcard/audio.m4a"
+    exit 1
+fi
+
+if [ ! -f "$FILE" ]; then
+    echo "Error: File not found: $FILE"
+    exit 1
+fi
+
+# Check for root
+if ! su -c 'id' >/dev/null 2>&1; then
+    echo "Error: Root access required"
+    exit 1
+fi
+
+# Get screen dimensions
+SCREEN=$(su -c 'wm size' 2>/dev/null | grep -oE '[0-9]+x[0-9]+' || echo "unknown")
+echo "Screen: $SCREEN"
+
+# Get MIME type
+FILENAME=$(basename "$FILE")
+ext="${FILENAME##*.}"
+ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+MIME="application/octet-stream"
+case "$ext_lower" in
+    mp3) MIME="audio/mpeg" ;;
+    m4a|mp4) MIME="audio/mp4" ;;
+    wav) MIME="audio/wav" ;;
+    ogg|oga) MIME="audio/ogg" ;;
+    flac) MIME="audio/flac" ;;
+    aac) MIME="audio/aac" ;;
+    mp4|m4v) MIME="video/mp4" ;;
+    webm) MIME="video/webm" ;;
+    mkv) MIME="video/x-matroska" ;;
+    jpg|jpeg) MIME="image/jpeg" ;;
+    png) MIME="image/png" ;;
+    gif) MIME="image/gif" ;;
+    webp) MIME="image/webp" ;;
+    bmp) MIME="image/bmp" ;;
+esac
+
+# Copy to shared storage with timestamp to avoid conflicts
+TIMESTAMP=$(date +%s)
+SHARED_FILE="${TIMESTAMP}_${FILENAME}"
+SHARED_PATH="/sdcard/Download/${SHARED_FILE}"
+
+echo "Preparing file..."
+su -c "cp '$FILE' '$SHARED_PATH'" 2>/dev/null || { echo "Error: Failed to copy file"; exit 1; }
+su -c "chmod 644 '$SHARED_PATH'" 2>/dev/null
+
+# Trigger media scan
+su -c "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d 'file://$SHARED_PATH'" >/dev/null 2>&1 || true
+
+echo "Sending $MIME to $PHONE..."
+
+# Try to open conversation with phone number
+# Try multiple activity names in order of preference
+ACTIVITIES=(
+    "com.google.android.apps.messaging/.ui.conversation.ConversationActivity"
+    "com.google.android.apps.messaging/.ui.conversation.LaunchConversationActivity"
+    "com.google.android.apps.messaging/.ui.conversationlist.ConversationListActivity"
+    "com.google.android.apps.messaging/.main.MainActivity"
+)
+
+OPENED=false
+for ACTIVITY in "${ACTIVITIES[@]}"; do
+    if su -c "am start -a android.intent.action.SENDTO -d 'smsto:$PHONE' -t '$MIME' -n $ACTIVITY" >/dev/null 2>&1; then
+        OPENED=true
+        echo "Opened: $ACTIVITY"
+        break
+    fi
+done
+
+if [ "$OPENED" = false ]; then
+    # Fallback: just open messaging app with SEND intent
+    su -c "am start -a android.intent.action.SEND -t '$MIME' --es 'address' '$PHONE' -p com.google.android.apps.messaging" >/dev/null 2>&1 || {
+        echo "Error: Could not open messaging app"
+        exit 1
+    }
+fi
+
+# Wait for activity to open
+sleep 2
+
+# Parse coordinates
+IFS=',' read -ra COORD <<< "$COORDS"
+ATTACH_X=${COORD[0]:-900}
+ATTACH_Y=${COORD[1]:-2200}
+MENU_X=${COORD[2]:-540}
+MENU_Y=${COORD[3]:-1800}
+FOLDER_X=${COORD[4]:-200}
+FOLDER_Y=${COORD[5]:-400}
+FILE_X=${COORD[6]:-540}
+FILE_Y=${COORD[7]:-600}
+SEND_X=${COORD[8]:-900}
+SEND_Y=${COORD[9]:-2200}
+
+# Check current focus
+FOCUS=$(su -c 'dumpsys window displays | grep mCurrentFocus' 2>/dev/null || true)
+echo "Focus: $(echo "$FOCUS" | cut -d= -f2)"
+
+# Check if we're in Google Messages
+if ! echo "$FOCUS" | grep -q "google.android.apps.messaging"; then
+    echo "Warning: Messaging app may not have opened correctly"
+    echo "Current: $FOCUS"
+fi
+
+# UI Automation
+if [ -n "$COORDS" ]; then
+    echo "Attaching file..."
+    
+    # Tap attachment button
+    su -c "input tap $ATTACH_X $ATTACH_Y"
+    sleep 1
+    
+    # Tap "Attach file" or gallery option
+    su -c "input tap $MENU_X $MENU_Y"
+    sleep 1
+    
+    # Navigate to Downloads folder if needed
+    su -c "input tap $FOLDER_X $FOLDER_Y"
+    sleep 1
+    
+    # Tap on our file (may need scrolling for larger lists)
+    su -c "input tap $FILE_X $FILE_Y"
+    sleep 1
+    
+    # Tap send button
+    su -c "input tap $SEND_X $SEND_Y"
+    
+    echo "MMS send sequence completed."
+else
+    echo "No coordinates provided - manual attachment required."
+    echo "Use --coords to specify tap coordinates for your device."
+fi
+
+echo ""
+echo "Sent to: $PHONE"
+echo "File: $SHARED_FILE"
+echo "Type: $MIME"

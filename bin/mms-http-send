@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""
+mms-http-send - Headless MMS via direct MMSC HTTP POST (no SmsManager, no UI)
+
+Encodes a WAP binary MMS M-Send.req PDU and POSTs it to the AT&T MMSC
+through the mobile data interface (rmnet_data1), bypassing WiFi.
+
+Usage:
+  mms-http-send <phone> <file> [mime-type]
+  mms-http-send +15550001111 /sdcard/DCIM/photo.jpg
+  mms-http-send +15550001111 /sdcard/audio.m4a audio/mp4
+  mms-http-send --show-config          # print effective config as JSON and exit
+"""
+
+import sys, os, re, time, random, string, subprocess, json
+
+# ── Configuration resolution ──────────────────────────────────────────────────
+# Priority (highest first):
+#   1. ~/.config/termux-sms/config  (INI-style key=value, # comments)
+#   2. OPENCLAW_MMS_FROM env var
+#   3. PHONE_NUMBER env var
+#   4. Built-in default (warns on stderr)
+
+CONFIG_FILE = os.path.expanduser('~/.config/termux-sms/config')
+_BUILTIN = {
+    'from_number': '',   # must be set in ~/.config/termux-sms/config or PHONE_NUMBER env
+    'interface':   'rmnet_data1',
+    'mmsc':        'http://mmsc.mobile.att.net',
+    'proxy_ip':    '172.26.39.1',
+    'proxy_port':  '80',
+    'max_bytes':   '900000',
+}
+
+def _load_config_file(path):
+    """Parse KEY = value config file; returns dict of lowercase keys."""
+    cfg = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    k, _, v = line.partition('=')
+                    cfg[k.strip().lower()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+def _resolve_config():
+    """Return (config_dict, sources_dict) with per-key provenance."""
+    file_cfg = _load_config_file(CONFIG_FILE)
+    cfg, sources = {}, {}
+
+    def pick(key, env_keys=(), warn_default=False):
+        if key in file_cfg:
+            cfg[key] = file_cfg[key]
+            sources[key] = f'file:{CONFIG_FILE}'
+            return
+        for env_key in env_keys:
+            val = os.environ.get(env_key, '').strip()
+            if val:
+                cfg[key] = val
+                sources[key] = f'env:{env_key}'
+                return
+        if warn_default and key == 'from_number':
+            print(f'[mms] Warning: FROM_NUMBER not set in {CONFIG_FILE}, '
+                  'OPENCLAW_MMS_FROM, or PHONE_NUMBER — using built-in default.',
+                  file=sys.stderr)
+            print(f'[mms] Edit {CONFIG_FILE} and set: FROM_NUMBER = +1XXXXXXXXXX',
+                  file=sys.stderr)
+        cfg[key] = _BUILTIN[key]
+        sources[key] = 'default'
+
+    pick('from_number', ('OPENCLAW_MMS_FROM', 'PHONE_NUMBER'), warn_default=True)
+    pick('interface',   ('OPENCLAW_MMS_INTERFACE',))
+    pick('mmsc',        ('OPENCLAW_MMS_MMSC',))
+    pick('proxy_ip',    ('OPENCLAW_MMS_PROXY_IP',))
+    pick('proxy_port',  ('OPENCLAW_MMS_PROXY_PORT',))
+    pick('max_bytes',   ('OPENCLAW_MMS_MAX_BYTES',))
+
+    return cfg, sources
+
+_CFG, _SOURCES = _resolve_config()
+
+FFMPEG        = '/data/data/com.termux/files/usr/bin/ffmpeg'
+MMS_FROM      = _CFG['from_number']
+MOBILE_IF     = _CFG['interface']          # explicit config value or default
+_INTERFACE_EXPLICIT = _SOURCES['interface'] != 'default'  # user set it → honour it exactly
+MMSC          = _CFG['mmsc']
+PROXY_PORT    = int(_CFG['proxy_port'])
+MMS_MAX_BYTES = int(_CFG['max_bytes'])
+
+# ── Interface auto-detection ──────────────────────────────────────────────────
+# When no explicit interface is configured, detect the active rmnet_data* at
+# send time so the script works across carrier data-channel rotations.
+
+def _detect_active_rmnet():
+    """Return first rmnet_data* interface that is UP and RUNNING, or None."""
+    try:
+        r = subprocess.run(['ifconfig'], capture_output=True, text=True, timeout=5)
+        current = None
+        for line in r.stdout.splitlines():
+            m = re.match(r'^(\S+):', line)
+            if m:
+                current = m.group(1)
+            if current and current.startswith('rmnet_data') and 'UP' in line and 'RUNNING' in line:
+                return current
+    except Exception:
+        pass
+    return None
+
+def _get_send_interface():
+    """Return the interface to use for this send, detecting if not configured."""
+    if _INTERFACE_EXPLICIT:
+        return MOBILE_IF
+    detected = _detect_active_rmnet()
+    return detected or MOBILE_IF
+
+# ── Proxy IP resolution ───────────────────────────────────────────────────────
+# Try DNS at runtime; fall back to cached IP from config if resolution fails.
+# The cached IP carries a resolution date — update config if sends start failing.
+PROXY_HOSTNAME = 'proxy.mobile.att.net'
+_CACHED_PROXY_IP = _CFG['proxy_ip']   # from ~/.config/termux-sms/config, dated in config comment
+
+def _resolve_proxy_ip():
+    import socket
+    try:
+        ip = socket.getaddrinfo(PROXY_HOSTNAME, None)[0][4][0]
+        return ip, 'dns'
+    except Exception:
+        return _CACHED_PROXY_IP, 'cached'
+
+PROXY_IP_FALLBACK, _PROXY_IP_SOURCE = _resolve_proxy_ip()
+
+# ── WAP binary field codes (OMA MMS 1.2, WAP-209) ───────────────────────────
+F_MESSAGE_TYPE   = 0x8C
+F_TRANSACTION_ID = 0x98
+F_MMS_VERSION    = 0x8D
+F_DATE           = 0x85
+F_FROM           = 0x89
+F_TO             = 0x97
+F_MESSAGE_CLASS  = 0x8A
+F_EXPIRY         = 0x88
+F_PRIORITY       = 0x8F
+F_CONTENT_TYPE   = 0x84
+
+MT_SEND_REQ      = 0x80   # m-send-req
+VER_1_2          = 0x92   # MMS 1.2
+
+# Well-known media types (WSP content type table, value | 0x80)
+CT_MULTIPART_RELATED = 0xB3   # application/vnd.wap.multipart.related
+CT_MULTIPART_MIXED   = 0xA3   # application/vnd.wap.multipart.mixed (0x23|0x80)
+
+# Well-known image types (WSP table)
+WSP_CT = {
+    'image/gif':       0x9D,   # 0x1D
+    'image/jpeg':      0x9E,   # 0x1E
+    'image/png':       0xA0,   # 0x20
+    'text/plain':      0x83,   # 0x03
+    'text/x-vcard':    0x87,   # 0x07
+    'text/vcard':      0x87,
+}
+# Audio, video, and other types are NOT in the WSP well-known table — use text-string
+
+# Well-known parameter codes (WSP param table, value | 0x80)
+PARAM_TYPE  = 0x89   # "type"  param code 0x09 | 0x80
+PARAM_START = 0x8A   # "start" param code 0x0A | 0x80
+
+
+# ── WAP binary encoding primitives ──────────────────────────────────────────
+
+def uintvar(n):
+    """Variable-length unsigned integer (7-bit chunks, MSB first, continuation bit)."""
+    if n == 0:
+        return b'\x00'
+    chunks = []
+    while n:
+        chunks.append(n & 0x7F)
+        n >>= 7
+    chunks.reverse()
+    out = bytearray()
+    for i, c in enumerate(chunks):
+        out.append(c | 0x80 if i < len(chunks) - 1 else c)
+    return bytes(out)
+
+def value_length(n):
+    """WAP value-length: short (< 31) or 0x1F + uintvar."""
+    return bytes([n]) if n < 31 else b'\x1f' + uintvar(n)
+
+def long_integer(n):
+    """WAP long-integer: 1-byte length prefix + big-endian bytes."""
+    if n == 0:
+        return b'\x01\x00'
+    b = n.to_bytes((n.bit_length() + 7) // 8, 'big')
+    return bytes([len(b)]) + b
+
+def text_string(s):
+    """Null-terminated ASCII/UTF-8 string."""
+    return s.encode('utf-8') + b'\x00'
+
+def encoded_string(s):
+    """WAP encoded-string-value: value-length + UTF-8 charset (0xEA short-int) + text + null.
+    Verified against real Android MMS PDU capture 2026-08-25."""
+    body = b'\xea' + s.encode('utf-8') + b'\x00'   # 0xEA = 0x6A|0x80 = UTF-8 as short-integer
+    return value_length(len(body)) + body
+
+
+# ── MMS PDU builder ──────────────────────────────────────────────────────────
+
+# Part header well-known codes (WSP header table, value | 0x80)
+HDR_CONTENT_ID       = 0xC0   # field 0x40
+HDR_CONTENT_LOCATION = 0x8E   # field 0x0E
+PARAM_NAME           = 0x85   # param 0x05 = "name"
+
+# MIME category helpers
+def mime_category(mime):
+    return mime.split('/')[0]   # 'image', 'audio', 'video', 'text', 'application'
+
+def norm_filename(mime):
+    """Normalised attachment filename matching Android's convention."""
+    exts = {
+        'image/jpeg': 'image000000.jpg', 'image/gif': 'image000000.gif',
+        'image/png':  'image000000.png', 'image/webp': 'image000000.webp',
+        'audio/mpeg': 'audio000000.mp3', 'audio/mp4':  'audio000000.m4a',
+        'audio/amr':  'audio000000.amr', 'audio/ogg':  'audio000000.ogg',
+        'audio/wav':  'audio000000.wav', 'audio/aac':  'audio000000.aac',
+        'video/mp4':  'video000000.mp4', 'video/3gpp': 'video000000.3gp',
+        'text/x-vcard': 'contact.vcf',  'text/vcard': 'contact.vcf',
+        'text/plain': 'message.txt',
+    }
+    return exts.get(mime, 'attachment.bin')
+
+def norm_cid(mime):
+    cat = mime_category(mime)
+    if cat == 'image': return '<image000000>'
+    if cat == 'audio': return '<audio000000>'
+    if cat == 'video': return '<video000000>'
+    if mime in ('text/x-vcard', 'text/vcard'): return '<contact>'
+    return '<attachment>'
+
+def ct_bytes_for_part(mime, fname):
+    """Encode Content-Type for a multipart part (content-general-form)."""
+    wk = WSP_CT.get(mime)
+    if wk:
+        ct_inner = bytes([wk]) + bytes([PARAM_NAME]) + text_string(fname)
+    else:
+        ct_inner = text_string(mime) + bytes([PARAM_NAME]) + text_string(fname)
+    return value_length(len(ct_inner)) + ct_inner
+
+def build_part(mime, data):
+    """Build a WAP multipart part for any supported MIME type."""
+    fname   = norm_filename(mime)
+    cid_val = norm_cid(mime)
+    ct_field = ct_bytes_for_part(mime, fname)
+    cid  = bytes([HDR_CONTENT_ID, 0x22]) + cid_val.encode() + b'\x00'
+    cloc = bytes([HDR_CONTENT_LOCATION]) + text_string(fname)
+    headers = ct_field + cid + cloc
+    return uintvar(len(headers)) + uintvar(len(data)) + headers + data
+
+def build_part_smil(smil_bytes):
+    """Build the SMIL part (always text, always content-general-form)."""
+    fname = 'smil.xml'
+    ct_inner = text_string('application/smil') + bytes([PARAM_NAME]) + text_string(fname)
+    ct_field = value_length(len(ct_inner)) + ct_inner
+    cid  = bytes([HDR_CONTENT_ID, 0x22]) + b'<smil>\x00'
+    cloc = bytes([HDR_CONTENT_LOCATION]) + text_string(fname)
+    headers = ct_field + cid + cloc
+    return uintvar(len(headers)) + uintvar(len(smil_bytes)) + headers + smil_bytes
+
+def build_smil(mime):
+    """Build SMIL document appropriate for the attachment type."""
+    cat   = mime_category(mime)
+    fname = norm_filename(mime)
+    cid   = norm_cid(mime).strip('<>') + '.ref'  # unused but kept for completeness
+
+    if cat == 'image':
+        region = '<region id="Image" fit="meet" top="0" left="0" height="100%" width="100%"/>'
+        media  = f'<img src="{fname}" region="Image" />'
+    elif cat == 'audio':
+        region = '<region id="Text" top="70%" left="0" width="100%" height="30%"/>'
+        media  = f'<audio src="{fname}" begin="0s" />'
+    elif cat == 'video':
+        region = '<region id="Image" fit="meet" top="0" left="0" height="100%" width="100%"/>'
+        media  = f'<video src="{fname}" region="Image" />'
+    else:
+        # vcard, text, etc. — attach without a visual region
+        region = ''
+        media  = f'<ref src="{fname}" />'
+
+    layout = f'<root-layout/>{region}' if region else '<root-layout/>'
+    return (
+        f'<smil><head><layout>{layout}</layout></head>'
+        f'<body><par dur="5000ms">{media}</par></body></smil>'
+    ).encode()
+
+def build_pdu(to_number, filepath, mime):
+    txn = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+
+    with open(filepath, 'rb') as f:
+        payload = f.read()
+
+    smil = build_smil(mime)
+
+    body = uintvar(2) + build_part_smil(smil) + build_part(mime, payload)
+
+    # Envelope Content-Type: multipart/related; start=<smil>; type=application/smil
+    ct_inner = (
+        bytes([CT_MULTIPART_RELATED]) +
+        bytes([PARAM_START]) + text_string('<smil>') +
+        bytes([PARAM_TYPE])  + text_string('application/smil')
+    )
+    ct_encoded = value_length(len(ct_inner)) + ct_inner
+
+    expiry_inner = bytes([0x81]) + long_integer(7 * 24 * 3600)
+    expiry = value_length(len(expiry_inner)) + expiry_inner
+
+    to_addr   = (to_number if to_number.startswith('+') else '+' + to_number) + '/TYPE=PLMN'
+    from_addr = MMS_FROM + '/TYPE=PLMN'
+    from_es    = encoded_string(from_addr)
+    from_inner = bytes([0x80]) + from_es
+    from_field = bytes([F_FROM]) + value_length(len(from_inner)) + from_inner
+
+    pdu = bytearray()
+    pdu += bytes([F_MESSAGE_TYPE, MT_SEND_REQ])
+    pdu += bytes([F_TRANSACTION_ID]) + text_string(txn)
+    pdu += bytes([F_MMS_VERSION, VER_1_2])
+    pdu += bytes([F_DATE])           + long_integer(int(time.time()))
+    pdu += from_field
+    pdu += bytes([F_TO])             + encoded_string(to_addr)
+    pdu += bytes([F_MESSAGE_CLASS, 0x80])
+    pdu += bytes([F_EXPIRY])         + expiry
+    pdu += bytes([0x86, 0x81])                    # Delivery-Report: No
+    pdu += bytes([F_PRIORITY, 0x81])
+    pdu += bytes([0x90, 0x81])                    # Read-Reply: No
+    pdu += bytes([F_CONTENT_TYPE])   + ct_encoded
+    pdu += body
+
+    return bytes(pdu), txn
+
+
+# ── Network: POST via curl (handles AT&T proxy protocol correctly) ────────────
+
+CURL = '/data/data/com.termux/files/usr/bin/curl'
+
+def post_pdu(pdu, iface=None):
+    """Write PDU to temp file, POST via curl through carrier WAP proxy on mobile iface."""
+    if iface is None:
+        iface = _get_send_interface()
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix='.pdu', delete=False)
+    tmp.write(pdu)
+    tmp.close()
+
+    cmd = [
+        CURL, '-s', '-i',
+        '--interface', iface,
+        '--proxy', f'{PROXY_IP_FALLBACK}:{PROXY_PORT}',
+        '-H', 'Accept: */*, application/vnd.wap.mms-message, application/vnd.wap.sic',
+        '-H', 'Accept-Language: en-US',
+        '-H', 'User-Agent: motorola/motorola_edge_(2021)/Android-16/Messages_31.9.226',
+        '-H', 'x-wap-profile: http://uaprof.motorola.com/phoneconfig/motov1/Profile/motov1.rdf',
+        '-H', 'Content-Type: application/vnd.wap.mms-message',
+        '-H', 'Connection: Keep-Alive',
+        '--data-binary', f'@{tmp.name}',
+        '--max-time', '30',
+        MMSC,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True)
+    os.unlink(tmp.name)
+
+    if result.returncode != 0:
+        raise OSError(f'curl error {result.returncode}: {result.stderr.decode(errors="replace")}')
+
+    return result.stdout
+
+
+# ── Image resize ─────────────────────────────────────────────────────────────
+
+def shrink_image(src_path, max_bytes=MMS_MAX_BYTES):
+    """
+    If the image exceeds max_bytes, use ffmpeg to scale it down iteratively.
+    Returns path to (possibly resized) file.
+    """
+    if os.path.getsize(src_path) <= max_bytes:
+        return src_path
+
+    import tempfile
+    ext = src_path.rsplit('.', 1)[-1].lower()
+    out = tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False)
+    out.close()
+    out_path = out.name
+
+    # Try decreasing scales until we fit
+    for scale in ['1280:-2', '960:-2', '640:-2', '480:-2']:
+        result = subprocess.run([
+            FFMPEG, '-y', '-i', src_path,
+            '-vf', f'scale={scale}',
+            '-q:v', '4',          # JPEG quality (lower = better for ffmpeg mjpeg)
+            out_path
+        ], capture_output=True)
+        if result.returncode == 0 and os.path.getsize(out_path) <= max_bytes:
+            ratio = os.path.getsize(src_path) / os.path.getsize(out_path)
+            print(f'[mms] Resized {scale}: {os.path.getsize(src_path)//1024}KB → {os.path.getsize(out_path)//1024}KB (÷{ratio:.1f})')
+            return out_path
+
+    print('[mms] Warning: could not shrink image below limit', file=sys.stderr)
+    return out_path
+
+
+# ── MIME detection ───────────────────────────────────────────────────────────
+
+MIME_MAP = {
+    'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+    'gif': 'image/gif',  'webp': 'image/webp',
+    'mp3': 'audio/mpeg', 'm4a': 'audio/mp4',  'ogg': 'audio/ogg',
+    'wav': 'audio/wav',  'aac': 'audio/aac',  'amr': 'audio/amr',
+    'mp4': 'video/mp4',  '3gp': 'video/3gpp', 'mkv': 'video/x-matroska',
+    'vcf': 'text/x-vcard',
+    'txt': 'text/plain',
+}
+
+def detect_mime(path):
+    ext = path.rsplit('.', 1)[-1].lower() if '.' in path else ''
+    return MIME_MAP.get(ext, 'application/octet-stream')
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == '--show-config':
+        active_iface = _get_send_interface()
+        out = {
+            'config': {k: _CFG[k] for k in sorted(_CFG)},
+            'sources': {k: _SOURCES[k] for k in sorted(_SOURCES)},
+            'config_file': CONFIG_FILE,
+            'config_file_exists': os.path.exists(CONFIG_FILE),
+            'interface_active': active_iface,
+            'interface_source': 'config' if _INTERFACE_EXPLICIT else 'auto-detect',
+            'proxy_ip_resolved': PROXY_IP_FALLBACK,
+            'proxy_ip_source': _PROXY_IP_SOURCE,  # 'dns' or 'cached'
+            'proxy_hostname': PROXY_HOSTNAME,
+        }
+        print(json.dumps(out, indent=2))
+        sys.exit(0)
+
+    args = sys.argv[1:]
+    json_mode = '--json' in args
+    args = [a for a in args if a != '--json']
+
+    if len(args) < 2:
+        print('Usage: mms-http-send <phone> <file> [mime] [--json]')
+        print('       mms-http-send --show-config')
+        sys.exit(1)
+
+    to_num   = args[0]
+    filepath = args[1]
+    mime     = args[2] if len(args) > 2 else detect_mime(filepath)
+
+    def fail(error, code):
+        if json_mode:
+            print(json.dumps({'status': 'error', 'to': to_num,
+                              'file': filepath, 'error': error, 'error_code': code}))
+        else:
+            print(f'[mms] ERROR: {error}', file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.exists(filepath):
+        fail(f'File not found: {filepath}', 'file_not_found')
+
+    size_kb = os.path.getsize(filepath) / 1024
+    if not json_mode:
+        print(f'[mms] To:   {to_num}')
+        print(f'[mms] File: {filepath} ({size_kb:.1f} KB, {mime})')
+        print(f'[mms] Via:  {PROXY_IP_FALLBACK}:{PROXY_PORT} → {MMSC}')
+
+    # Resize image if needed; warn if audio/video is oversized
+    if mime.startswith('image/'):
+        filepath = shrink_image(filepath)
+    elif os.path.getsize(filepath) > MMS_MAX_BYTES:
+        if not json_mode:
+            print(f'[mms] Warning: {size_kb:.0f}KB exceeds ~900KB limit — AT&T may reject', file=sys.stderr)
+
+    if not json_mode:
+        print('[mms] Encoding PDU...')
+    pdu, txn = build_pdu(to_num, filepath, mime)
+    if not json_mode:
+        print(f'[mms] PDU size: {len(pdu)} bytes  txn-id: {txn}')
+        print(f'[mms] Posting via {_get_send_interface()}...')
+
+    try:
+        response = post_pdu(pdu)
+    except PermissionError:
+        fail('SO_BINDTODEVICE requires root — re-run with su', 'permission_denied')
+    except OSError as e:
+        fail(f'Network error: {e}', 'network_error')
+
+    status_line = response.split(b'\r\n')[0].decode(errors='replace')
+    header_end  = response.find(b'\r\n\r\n')
+    resp_body   = response[header_end + 4:] if header_end >= 0 else b''
+    confirmed   = len(resp_body) > 1 and resp_body[1] == 0x81
+
+    ok = b' 200 ' in status_line.encode() or b' 204 ' in status_line.encode()
+
+    if json_mode:
+        out = {
+            'status':      'sent' if ok else 'error',
+            'to':          to_num,
+            'file':        filepath,
+            'mime':        mime,
+            'pdu_bytes':   len(pdu),
+            'txn_id':      txn,
+            'http_status': status_line,
+        }
+        if confirmed:
+            out['carrier_confirmed'] = True
+        if not ok:
+            out['error'] = 'Unexpected HTTP status from MMSC'
+            out['error_code'] = 'mmsc_rejected'
+        print(json.dumps(out))
+    else:
+        print(f'[mms] Response: {status_line}')
+        if confirmed:
+            print('[mms] Carrier confirmed: m-send-conf received ✓')
+        elif resp_body:
+            print(f'[mms] Response body ({len(resp_body)} bytes): {resp_body[:40].hex()}')
+        if ok:
+            print('[mms] Sent successfully.')
+        else:
+            print('[mms] Unexpected HTTP status — check response above.')
+
+    if not ok:
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

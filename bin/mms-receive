@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+mms-receive — Query received MMS from the Android telephony content provider.
+
+Usage:
+  mms-receive [--limit N] [--since ID] [--save DIR] [--json]
+  mms-receive --show-config
+
+Requires root (su) to query content://mms and copy part files.
+Platform: Android/Termux only.
+"""
+
+import sys, os, re, json, subprocess, shutil
+from pathlib import Path
+
+# ── Configuration resolution ──────────────────────────────────────────────────
+# Priority (highest first):
+#   1. ~/.config/termux-sms/config   (INI-style KEY = value, # comments)
+#   2. Environment variables
+#   3. Built-in defaults
+
+CONFIG_FILE = os.path.expanduser("~/.config/termux-sms/config")
+CONTENT     = "/system/bin/content"
+ADDR_TYPE_FROM = "137"   # sender address type in telephony DB
+
+_BUILTIN = {
+    "save_dir": os.path.expanduser("~/.termux-sms/media/inbound"),
+    "limit":    "10",
+}
+
+def _load_config_file(path):
+    cfg = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    cfg[k.strip().lower()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+def _resolve_config():
+    file_cfg = _load_config_file(CONFIG_FILE)
+    cfg, sources = {}, {}
+
+    def pick(key, env_keys=()):
+        if key in file_cfg:
+            cfg[key] = file_cfg[key]
+            sources[key] = f"file:{CONFIG_FILE}"
+            return
+        for env_key in env_keys:
+            val = os.environ.get(env_key)
+            if val:
+                cfg[key] = val
+                sources[key] = f"env:{env_key}"
+                return
+        cfg[key] = _BUILTIN[key]
+        sources[key] = "default"
+
+    pick("save_dir", ("MMS_RECEIVE_SAVE_DIR",))
+    pick("limit",    ("MMS_RECEIVE_LIMIT",))
+    cfg["save_dir"] = os.path.expanduser(cfg["save_dir"])
+    return cfg, sources
+
+CFG, _SOURCES = _resolve_config()
+
+# ── Content provider helpers ──────────────────────────────────────────────────
+
+def _content_query(uri, projection=None, where=None, sort=None):
+    """Run /system/bin/content query as root; return list of row dicts."""
+    cmd = f"{CONTENT} query --uri '{uri}'"
+    if projection:
+        cmd += f" --projection '{':'.join(projection)}'"
+    if where:
+        cmd += f" --where \"{where}\""
+    if sort:
+        cmd += f" --sort '{sort}'"
+    try:
+        r = subprocess.run(["su", "-c", cmd], capture_output=True, text=True, timeout=15)
+        return _parse_rows(r.stdout)
+    except Exception as e:
+        print(f"[mms-receive] content query failed: {e}", file=sys.stderr)
+        return []
+
+def _parse_rows(output):
+    """Parse 'Row: N key=val, key=val' lines into list of dicts."""
+    rows = []
+    for line in output.splitlines():
+        m = re.match(r"^Row:\s+\d+\s+(.+)$", line)
+        if not m:
+            continue
+        row = {}
+        for token in re.split(r",\s+(?=\w+=)", m.group(1)):
+            if "=" in token:
+                k, _, v = token.partition("=")
+                row[k.strip()] = None if v.strip() == "NULL" else v.strip()
+        rows.append(row)
+    return rows
+
+def _copy_part(src_path, dest_path):
+    """Copy a telephony part file via root."""
+    try:
+        subprocess.run(
+            ["su", "-c", f"cp '{src_path}' '{dest_path}' && chmod 644 '{dest_path}'"],
+            capture_output=True, timeout=10, check=True
+        )
+        return True
+    except Exception:
+        return False
+
+# ── MMS fetch logic ───────────────────────────────────────────────────────────
+
+def get_sender(mms_id):
+    rows = _content_query(
+        f"content://mms/{mms_id}/addr",
+        projection=["address", "type"],
+    )
+    for row in rows:
+        if row.get("type") == ADDR_TYPE_FROM:
+            return row.get("address", "unknown")
+    return "unknown"
+
+def get_parts(mms_id, save_dir=None):
+    rows = _content_query(
+        f"content://mms/{mms_id}/part",
+        projection=["_id", "ct", "_data", "name", "text"],
+    )
+    parts = []
+    for row in rows:
+        ct = row.get("ct") or ""
+        if ct == "application/smil":
+            continue   # layout metadata, not content
+
+        part = {
+            "id":   row.get("_id"),
+            "mime": ct,
+            "name": row.get("name"),
+        }
+
+        data_path = row.get("_data")
+        if data_path and save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            ext  = Path(data_path).suffix or ""
+            dest = os.path.join(save_dir, f"part_{row['_id']}{ext}")
+            if _copy_part(data_path, dest):
+                part["saved_path"] = dest
+                part["size"] = os.path.getsize(dest) if os.path.exists(dest) else None
+            else:
+                part["saved_path"] = None
+                part["error"] = f"copy failed from {data_path}"
+        elif data_path:
+            part["source_path"] = data_path  # caller must copy if no save_dir
+        elif row.get("text"):
+            part["text"] = row.get("text")   # inline text/plain or similar
+
+        parts.append(part)
+    return parts
+
+def fetch_mms(limit=None, since_id=None, save_dir=None, oldest_first=False):
+    limit = int(limit or CFG["limit"])
+    where = f"_id > {int(since_id)}" if since_id is not None else None
+
+    if oldest_first:
+        # ASC: get the oldest N messages first — correct for high-water mark polling
+        rows = _content_query(
+            "content://mms/inbox",
+            projection=["_id", "date", "thread_id"],
+            where=where,
+            sort="_id ASC",
+        )
+        rows = rows[:limit]
+    else:
+        # DESC: get the newest N then reverse — correct for "show latest" display
+        rows = _content_query(
+            "content://mms/inbox",
+            projection=["_id", "date", "thread_id"],
+            where=where,
+            sort="_id DESC",
+        )
+        rows = rows[:limit]
+        rows = list(reversed(rows))
+
+    results = []
+    for row in rows:
+        mms_id  = row.get("_id")
+        date_ts = int(row.get("date") or 0)
+        save_to = None
+        if save_dir:
+            import datetime
+            ts = datetime.datetime.fromtimestamp(date_ts).strftime("%Y%m%d_%H%M%S")
+            sender_raw = get_sender(mms_id)
+            safe_sender = re.sub(r"[^\d+]", "", sender_raw)
+            save_to = os.path.join(save_dir, f"{ts}_{safe_sender}_{mms_id}")
+
+        results.append({
+            "id":        int(mms_id),
+            "date":      date_ts,
+            "thread_id": row.get("thread_id"),
+            "sender":    get_sender(mms_id),
+            "parts":     get_parts(mms_id, save_dir=save_to),
+        })
+    return results
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def show_config():
+    print(json.dumps({
+        "config": CFG,
+        "sources": _SOURCES,
+        "config_file": CONFIG_FILE,
+        "config_file_exists": os.path.exists(CONFIG_FILE),
+        "content_binary": CONTENT,
+        "content_binary_exists": os.path.exists(CONTENT),
+    }, indent=2))
+
+def main():
+    args = sys.argv[1:]
+
+    if "--show-config" in args:
+        show_config()
+        return
+
+    limit        = None
+    since_id     = None
+    save_dir     = CFG["save_dir"]
+    no_save      = False
+    oldest_first = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-l", "--limit") and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif a == "--since" and i + 1 < len(args):
+            since_id = int(args[i + 1]); i += 2
+        elif a == "--save" and i + 1 < len(args):
+            save_dir = os.path.expanduser(args[i + 1]); i += 2
+        elif a == "--no-save":
+            no_save = True; i += 1
+        elif a == "--oldest-first":
+            oldest_first = True; i += 1
+        elif a == "--json":
+            i += 1   # json is always the output format
+        else:
+            print(f"[mms-receive] unknown argument: {a}", file=sys.stderr)
+            sys.exit(1)
+
+    if no_save:
+        save_dir = None
+
+    results = fetch_mms(limit=limit, since_id=since_id, save_dir=save_dir, oldest_first=oldest_first)
+    print(json.dumps(results, indent=2))
+
+if __name__ == "__main__":
+    main()
