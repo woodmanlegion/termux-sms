@@ -61,11 +61,16 @@ state. Both directions go through it:
 Both directions land in the same `~/.termux-sms/messages.jsonl`, each
 entry stamped with `direction: inbound|outbound`.
 
-Looking forward: `termux-sms-channel` (the openclaw plugin, still
-separate, not yet rewired) should call `send_sms`/`send_mms` from the
-shared lib directly instead of invoking the raw CLI tools itself — even
-as a pure pass-through, that keeps logging in exactly one place instead
-of being duplicated per-consumer.
+**Done**: `termux-sms-channel` (the openclaw plugin) now calls
+`termux-sms-send` for both `sms` and `mms` instead of invoking the raw
+`sms-send`/`mms-http-send` binaries at their old per-skill paths —
+outbound from that channel is logged here too, same as everything else.
+Its own inbound polling is still separate and untouched — it runs its
+own loop against the SIM rather than subscribing as a `termux-sms-poll`
+handler. Collapsing that into one poller is still open, and a larger
+task than the send-side rewiring was (allowFrom/secondary-number/
+slash-command/agent-dispatch logic all still lives there, deliberately
+not touched).
 
 ```bash
 termux-sms handlers add ~/my-scripts/notify-slack.sh
