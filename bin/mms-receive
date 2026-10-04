@@ -38,7 +38,7 @@ def _load_config_file(path):
                     continue
                 if "=" in line:
                     k, _, v = line.partition("=")
-                    cfg[k.strip().lower()] = v.strip()
+                    cfg[k.strip().lower()] = v.partition('#')[0].strip()  # strip inline comment, not just full-line
     except FileNotFoundError:
         pass
     return cfg
