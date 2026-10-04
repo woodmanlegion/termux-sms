@@ -89,10 +89,15 @@ def log_message(direction, kind, record):
         f.write(json.dumps(entry) + "\n")
 
 
-def send_sms(to, body):
+def send_sms(to, body, tag=None):
     """The message-manager's send entrypoint for SMS. Logs outbound
     before returning, success or failure, so sent messages are never
-    silently un-recorded the way they were before this existed."""
+    silently un-recorded the way they were before this existed.
+
+    tag: optional free-form string (e.g. "slash") a caller can attach
+    to correlate this send with something it knows and the message
+    manager doesn't -- omitted from the record entirely when absent,
+    rather than logging a null field on every ordinary send."""
     try:
         result = subprocess.run(
             [str(BIN_DIR / "sms-send"), to, body, "--json"],
@@ -103,15 +108,18 @@ def send_sms(to, body):
         payload = {"status": "error", "error": str(e)}
 
     ok = payload.get("status") == "sent"
-    log_message("outbound", "sms", {"to": to, "body": body,
-                                     "status": "sent" if ok else "error",
-                                     "error": payload.get("error")})
+    record = {"to": to, "body": body,
+              "status": "sent" if ok else "error",
+              "error": payload.get("error")}
+    if tag:
+        record["tag"] = tag
+    log_message("outbound", "sms", record)
     return ok, payload
 
 
-def send_mms(to, file_path):
+def send_mms(to, file_path, tag=None):
     """The message-manager's send entrypoint for MMS. Same logging
-    guarantee as send_sms."""
+    guarantee as send_sms, same optional tag."""
     try:
         result = subprocess.run(
             [str(BIN_DIR / "mms-send"), to, file_path, "--json"],
@@ -122,7 +130,10 @@ def send_mms(to, file_path):
         payload = {"status": "error", "error": str(e)}
 
     ok = payload.get("status") == "sent"
-    log_message("outbound", "mms", {"to": to, "file": file_path,
-                                     "status": "sent" if ok else "error",
-                                     "error": payload.get("error")})
+    record = {"to": to, "file": file_path,
+              "status": "sent" if ok else "error",
+              "error": payload.get("error")}
+    if tag:
+        record["tag"] = tag
+    log_message("outbound", "mms", record)
     return ok, payload

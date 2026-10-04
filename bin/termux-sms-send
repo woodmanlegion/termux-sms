@@ -11,8 +11,13 @@ design (see AGENTS.md). Anything that wants the outbound record kept
 this instead.
 
 Usage:
-  termux-sms-send sms <phone> <message> [--json]
-  termux-sms-send mms <phone> <file> [--json]
+  termux-sms-send sms <phone> <message> [--json] [--tag <value>]
+  termux-sms-send mms <phone> <file> [--json] [--tag <value>]
+
+--tag attaches a free-form label (e.g. "slash") to the outbound record
+in messages.jsonl, for callers that know something about the send the
+message manager doesn't (e.g. termux-sms-channel marking a reply as a
+slash-command response). Omitted by default.
 """
 
 import sys, json
@@ -27,16 +32,25 @@ def main():
     json_mode = "--json" in args
     args = [a for a in args if a != "--json"]
 
+    tag = None
+    if "--tag" in args:
+        i = args.index("--tag")
+        if i + 1 >= len(args):
+            print("Usage: --tag requires a value", file=sys.stderr)
+            sys.exit(1)
+        tag = args[i + 1]
+        del args[i:i + 2]
+
     if len(args) < 3 or args[0] not in ("sms", "mms"):
-        print("Usage: termux-sms-send <sms|mms> <phone> <message-or-file> [--json]", file=sys.stderr)
+        print("Usage: termux-sms-send <sms|mms> <phone> <message-or-file> [--json] [--tag <value>]", file=sys.stderr)
         sys.exit(1)
 
     kind, to, payload_arg = args[0], args[1], args[2]
 
     if kind == "sms":
-        ok, result = mgr.send_sms(to, payload_arg)
+        ok, result = mgr.send_sms(to, payload_arg, tag=tag)
     else:
-        ok, result = mgr.send_mms(to, payload_arg)
+        ok, result = mgr.send_mms(to, payload_arg, tag=tag)
 
     if json_mode:
         print(json.dumps(result))
