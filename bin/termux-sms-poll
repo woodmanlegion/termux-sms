@@ -61,10 +61,31 @@ def apply_rate_limit_fix():
 # ── State ───────────────────────────────────────────────────────────────────
 
 def load_state():
+    """Returns None if there's no state file yet -- caller must initialize
+    it by calling init_fresh_state(), not by assuming {-1, 0}. Starting a
+    fresh install from the beginning of history is wrong twice over: it
+    floods every handler with years of backlog, and for MMS specifically
+    it's also a real bug -- each message needs a slow per-message `su`
+    content-provider round-trip, so a full-history replay can take much
+    longer than one poll cycle's timeout, which means mmsHighWater never
+    advances and the next cycle retries the exact same slow full replay,
+    forever. Found live: a device with years of MMS history timed out at
+    20s on every single cycle because of this.
+    """
     try:
         return json.loads(STATE_FILE.read_text())
     except Exception:
-        return {"smsHighWater": -1, "mmsHighWater": 0}
+        return None
+
+
+def init_fresh_state():
+    """First run: start from 'now' -- the current latest id on each side,
+    not from the beginning of history."""
+    latest_sms = run_json([str(BIN_DIR / "sms-receive"), "--limit", "1", "--json"])
+    latest_mms = run_json([str(BIN_DIR / "mms-receive"), "--limit", "1", "--no-save", "--json"])
+    sms_hw = max((m["id"] for m in latest_sms), default=-1)
+    mms_hw = max((m["id"] for m in latest_mms), default=0)
+    return {"smsHighWater": sms_hw, "mmsHighWater": mms_hw}
 
 
 def save_state(state):
@@ -90,9 +111,9 @@ def load_config():
 
 # ── Fetch (shells out to sms-receive / mms-receive -- no logic duplicated) ────
 
-def run_json(cmd):
+def run_json(cmd, timeout=45):
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return json.loads(result.stdout)
     except Exception as e:
         warn(f"{cmd[0]} failed: {e}")
@@ -140,6 +161,12 @@ def main():
     apply_rate_limit_fix()
 
     state = load_state()
+    if state is None:
+        state = init_fresh_state()
+        save_state(state)
+        log(f"first run -- starting from current (sms={state['smsHighWater']}, "
+            f"mms={state['mmsHighWater']}), not replaying history")
+        return
     changed = False
 
     new_sms = fetch_new_sms(state["smsHighWater"])
